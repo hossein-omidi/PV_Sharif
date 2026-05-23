@@ -61,3 +61,10 @@ def register_envs() -> None:
         max_episode_steps=500,
         kwargs={"reward_id": "dense"},
     )
+
+    gym.register(
+        id="PVSimEnv-v0",
+        entry_point="custom_rl.envs.pv_sim_env:PVSimEnv",
+        max_episode_steps=500,
+    )
+    
