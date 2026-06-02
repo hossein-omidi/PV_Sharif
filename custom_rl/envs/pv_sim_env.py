@@ -10,6 +10,12 @@ import pandas as pd
 import pvlib
 from gymnasium import spaces
 
+from custom_rl.weather import (
+    fetch_pvgis_tmy,
+    normalize_weather_index,
+    validate_weather_columns,
+)
+
 
 class PVSimEnv(gym.Env):
     """
@@ -45,6 +51,8 @@ class PVSimEnv(gym.Env):
         panel_efficiency: float = 0.18,
         start_time: str = "2026-06-21 08:00",
         step_minutes: int = 5,
+        weather_mode: str = "clearsky",
+        pvgis_weather_data: pd.DataFrame | None = None,
     ) -> None:
         super().__init__()
 
@@ -70,6 +78,31 @@ class PVSimEnv(gym.Env):
             altitude=self.altitude,
             name="PVSimEnv location",
         )
+        
+        self.weather_mode = weather_mode.lower()
+        self.weather_data: pd.DataFrame | None = None
+        self.weather_metadata: dict[str, Any] | None = None
+        self._last_weather_source_time: str | None = None
+
+        if self.weather_mode not in {"clearsky", "pvgis_tmy"}:
+            raise ValueError(
+                "weather_mode must be either 'clearsky' or 'pvgis_tmy'. "
+                f"Got: {weather_mode}"
+            )
+
+        if self.weather_mode == "pvgis_tmy":
+            if pvgis_weather_data is None:
+                pvgis_weather_data, self.weather_metadata = fetch_pvgis_tmy(
+                    latitude=self.latitude,
+                    longitude=self.longitude,
+                )
+
+            self.weather_data = normalize_weather_index(
+                pvgis_weather_data,
+                timezone=self.timezone,
+            )
+            validate_weather_columns(self.weather_data)
+            self.weather_data = self.weather_data.sort_index()
 
         # state:
         # [solar_altitude, solar_azimuth, panel_tilt, panel_azimuth, poa_irradiance]
@@ -122,6 +155,8 @@ class PVSimEnv(gym.Env):
 
         info = {
             "time": str(self.current_time),
+            "weather_mode": self.weather_mode,
+            "weather_source_time": self._last_weather_source_time,  
             "solar_altitude": solar_altitude,
             "solar_azimuth": solar_azimuth,
             "panel_tilt": panel_tilt,
@@ -194,6 +229,8 @@ class PVSimEnv(gym.Env):
 
         info = {
             "time": str(self.current_time),
+            "weather_mode": self.weather_mode,
+            "weather_source_time": self._last_weather_source_time,
             "solar_altitude": solar_altitude,
             "solar_azimuth": solar_azimuth,
             "panel_tilt": panel_tilt,
@@ -217,7 +254,10 @@ class PVSimEnv(gym.Env):
         times = pd.DatetimeIndex([timestamp])
 
         solar_position = self.location.get_solarposition(times)
-        clear_sky = self.location.get_clearsky(times)
+        irradiance_data = self._get_irradiance_data(
+            times=times,
+            timestamp=timestamp,
+        )
 
         apparent_elevation = float(solar_position["apparent_elevation"].iloc[0])
         solar_azimuth = float(solar_position["azimuth"].iloc[0])
@@ -231,9 +271,9 @@ class PVSimEnv(gym.Env):
             surface_azimuth=panel_azimuth,
             solar_zenith=solar_position["apparent_zenith"],
             solar_azimuth=solar_position["azimuth"],
-            dni=clear_sky["dni"],
-            ghi=clear_sky["ghi"],
-            dhi=clear_sky["dhi"],
+            dni=irradiance_data["dni"],
+            ghi=irradiance_data["ghi"],
+            dhi=irradiance_data["dhi"],
         )
 
         poa_global = float(poa_irradiance["poa_global"].iloc[0])
@@ -243,6 +283,66 @@ class PVSimEnv(gym.Env):
 
         return apparent_elevation, solar_azimuth, poa_global, float(pv_power)
 
+    def _get_irradiance_data(
+        self,
+        times: pd.DatetimeIndex,
+        timestamp: pd.Timestamp,
+    ) -> pd.DataFrame:
+        """Return irradiance data from either clear-sky pvlib or PVGIS TMY."""
+        if self.weather_mode == "clearsky":
+            self._last_weather_source_time = str(timestamp)
+            return self.location.get_clearsky(times)[["ghi", "dni", "dhi"]]
+
+        if self.weather_mode == "pvgis_tmy":
+            weather_row = self._get_pvgis_weather_row(timestamp)
+            self._last_weather_source_time = str(weather_row.name)
+
+            # Important:
+            # Re-index the selected TMY row to the simulation timestamp.
+            # Otherwise pandas may align different years and produce NaN.
+            return pd.DataFrame(
+                {
+                    "ghi": [float(weather_row["ghi"])],
+                    "dni": [float(weather_row["dni"])],
+                    "dhi": [float(weather_row["dhi"])],
+                },
+                index=times,
+            )
+
+        raise RuntimeError(f"Unsupported weather_mode: {self.weather_mode}")
+
+    def _get_pvgis_weather_row(self, timestamp: pd.Timestamp) -> pd.Series:
+        """Map simulation timestamp to the nearest matching PVGIS TMY row."""
+        if self.weather_data is None:
+            raise RuntimeError("PVGIS weather data is not loaded.")
+
+        target = pd.Timestamp(timestamp)
+
+        if target.tzinfo is None:
+            target = target.tz_localize(self.timezone)
+        else:
+            target = target.tz_convert(self.timezone)
+
+        weather_index = self.weather_data.index
+        tmy_year = int(weather_index[0].year)
+
+        # PVGIS TMY usually uses a representative year in the index.
+        # We keep month/day/hour/minute from the simulation time, but map the
+        # year to the TMY year.
+        try:
+            target = target.replace(year=tmy_year)
+        except ValueError:
+            # Handles Feb 29 if the TMY year is not a leap year.
+            target = target.replace(year=tmy_year, day=28)
+
+        if weather_index.tz is not None:
+            target = target.tz_convert(weather_index.tz)
+        else:
+            target = target.tz_localize(None)
+
+        nearest_position = weather_index.get_indexer([target], method="nearest")[0]
+        return self.weather_data.iloc[nearest_position]
+    
     @staticmethod
     def _circular_angle_error(angle_a: float, angle_b: float) -> float:
         """Return the minimum absolute difference between two angles in degrees."""
